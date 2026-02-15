@@ -17,6 +17,11 @@ SUPERSCRIPT_FLAG = 1
 # Subscript flag (bit 5)
 SUBSCRIPT_FLAG = 32
 
+# Questions that have diagrams (vector graphics) that must be rendered
+DIAGRAM_QUESTIONS = {4, 7, 12, 19, 20, 23, 25, 28}
+# Padding around diagram bbox to include nearby labels (in points)
+DIAGRAM_PADDING = 8
+
 
 def transform_math_for_llm(text: str) -> str:
     """
@@ -62,7 +67,7 @@ def extract_text_with_notation(page: pymupdf.Page) -> str:
 def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> list:
     """
     Get all items (text and images) from a page in reading order.
-    Returns list of (y0, "text", text_str) or (y0, "image", (bytes, ext)).
+    Returns list of (y0, y1, "text", text_str) or (y0, y1, "image", (bytes, ext)).
     """
     items = []
     try:
@@ -72,12 +77,12 @@ def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> 
 
     for block in blocks:
         bbox = block.get("bbox", (0, 0, 0, 0))
-        y0 = bbox[1]
+        y0, y1 = bbox[1], bbox[3]
         if block.get("type") == 1:
             img_data = block.get("image")
             if img_data:
                 ext = block.get("ext", "png")
-                items.append((y0, "image", (img_data, ext)))
+                items.append((y0, y1, "image", (img_data, ext)))
         else:
             text_parts = []
             for line in block.get("lines", []):
@@ -94,7 +99,7 @@ def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> 
                 text_parts.append("".join(line_parts))
             text = "\n".join(text_parts)
             if text.strip():
-                items.append((y0, "text", text))
+                items.append((y0, y1, "text", text))
 
     # Also get images via get_images() - dict blocks may not include all
     seen_xrefs = set()
@@ -107,7 +112,8 @@ def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> 
             img_info = doc.extract_image(xref)
             rects = page.get_image_rects(xref) if hasattr(page, "get_image_rects") else []
             y0 = rects[0][1] if rects else 0
-            items.append((y0, "image", (img_info["image"], img_info["ext"])))
+            y1 = rects[0][3] if rects else y0 + 50
+            items.append((y0, y1, "image", (img_info["image"], img_info["ext"])))
         except Exception:
             pass
 
@@ -137,13 +143,13 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     doc = pymupdf.open(pdf_path)
 
-    # Build full text and ordered list of (page, y0, type, content)
+    # Build full text and ordered list of (page, y0, y1, type, content)
     all_items = []
     full_text_parts = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        for y0, item_type, content in get_page_items(page, doc, page_num):
-            all_items.append((page_num, y0, item_type, content))
+        for y0, y1, item_type, content in get_page_items(page, doc, page_num):
+            all_items.append((page_num, y0, y1, item_type, content))
             if item_type == "text":
                 full_text_parts.append(content)
 
@@ -153,13 +159,27 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
     # Extract question text
     questions_text = {qnum: full_text[start:end] for qnum, start, end in question_splits}
 
+    # Build question -> (page_num, y_start, y_end) for text blocks
+    question_rects = {qnum: [] for qnum, _, _ in question_splits}
+    current_q = question_splits[0][0] if question_splits else 1
+    text_pos = 0
+
+    for page_num, y0, y1, item_type, content in all_items:
+        if item_type == "text":
+            for qnum, start, end in question_splits:
+                if start <= text_pos < end:
+                    current_q = qnum
+                    break
+            question_rects[current_q].append((page_num, y0, y1))
+            text_pos += len(content) + 1
+
     # Associate images with questions: process items in order, track text position
     q_images = {qnum: [] for qnum, _, _ in question_splits}
     current_q = question_splits[0][0] if question_splits else 1
     text_pos = 0
     seen_image_hashes = set()
 
-    for page_num, y0, item_type, content in all_items:
+    for page_num, y0, y1, item_type, content in all_items:
         if item_type == "text":
             for qnum, start, end in question_splits:
                 if start <= text_pos < end:
@@ -168,13 +188,57 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
             text_pos += len(content) + 1
         elif item_type == "image":
             img_data, ext = content
-            # Deduplicate by content hash (same image may appear in dict and get_images)
             h = hash(img_data) if len(img_data) < 10000 else hash(img_data[:1000])
             if h in seen_image_hashes:
                 continue
             seen_image_hashes.add(h)
             if current_q in q_images:
                 q_images[current_q].append((img_data, ext))
+
+    # Extract diagram regions for DIAGRAM_QUESTIONS
+    # Diagrams appear between a question's text and the next question's text on the same page
+    q_diagram_rects = {}
+    qnums_sorted = [qnum for qnum, _, _ in question_splits]
+    for qnum in DIAGRAM_QUESTIONS:
+        if qnum not in qnums_sorted:
+            continue
+        rects = question_rects.get(qnum, [])
+        if not rects:
+            continue
+        page_num = rects[0][0]
+        q_y0 = min(r[1] for r in rects)
+        q_y1 = max(r[2] for r in rects)
+
+        # Find next question on same page (diagram is between this and next)
+        idx = qnums_sorted.index(qnum)
+        next_on_page = None
+        for nq in qnums_sorted[idx + 1:]:
+            nrects = question_rects.get(nq, [])
+            if nrects and any(r[0] == page_num for r in nrects):
+                next_on_page = nq
+                break
+        if next_on_page:
+            nr = [r for r in question_rects[next_on_page] if r[0] == page_num]
+            next_y0 = min(r[1] for r in nr)
+            diagram_y1 = next_y0 - 5  # Stop just before next question
+        else:
+            diagram_y1 = doc[page_num].rect.height - 36  # Bottom of page minus margin
+
+        # Diagram region: from bottom of question text to top of next question
+        diagram_y0 = q_y1 + 2  # Start just below question text
+        min_height = 30
+        if diagram_y1 <= diagram_y0:
+            # Overlapping - use fixed height below question (diagram may be inline)
+            diagram_y1 = min(q_y1 + 120, doc[page_num].rect.height - 36)
+        if diagram_y1 - diagram_y0 < min_height:
+            diagram_y1 = diagram_y0 + min(150, doc[page_num].rect.height - 36 - diagram_y0)
+
+        page = doc[page_num]
+        diagram_rect = pymupdf.Rect(
+            page.rect.x0 + 36, diagram_y0,
+            page.rect.x1 - 36, diagram_y1
+        )
+        q_diagram_rects[qnum] = [(page_num, diagram_rect)]
 
     # Write output files
     for qnum, start, end in question_splits:
@@ -189,6 +253,19 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
             img_path = output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}"
             img_path.write_bytes(img_data)
             print(f"  Wrote diagram {img_path}")
+
+        # Render vector diagrams for questions that have them
+        if qnum in DIAGRAM_QUESTIONS and q_diagram_rects.get(qnum):
+            rects = q_diagram_rects[qnum]
+            page_num = rects[0][0]
+            diagram_rect = rects[0][1]
+            for _, r in rects[1:]:
+                diagram_rect |= r
+            page = doc[page_num]
+            pix = page.get_pixmap(dpi=150, clip=diagram_rect)
+            diagram_path = output_dir / f"{qname}.png"
+            pix.save(str(diagram_path))
+            print(f"  Wrote diagram {diagram_path}")
 
     doc.close()
 
