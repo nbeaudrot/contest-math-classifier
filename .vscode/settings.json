@@ -1,0 +1,5 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "C:\\Users\\niq\\AppData\\Local\\Programs\\Python\\Launcher;C:\\Users\\niq\\AppData\\Local\\Programs\\Python\\Python312;C:\\Users\\niq\\AppData\\Local\\Programs\\Python\\Python312\\Scripts;${env:PATH}"
+  }
+}

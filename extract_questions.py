@@ -7,10 +7,24 @@ and saves diagram images as PNG files.
 
 import argparse
 import re
+import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import pymupdf
+
+
+@dataclass
+class Question:
+    """A single extracted question with optional diagram region."""
+
+    number: int
+    text: str
+    y0: float
+    y1: float
+    image_rect: Optional[tuple[int, pymupdf.Rect]] = None  # (page_num, rect) for diagram
 
 
 # Superscript flag in PyMuPDF span flags (bit 0)
@@ -246,16 +260,34 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path, overwrite: bool
         if diagram_rect.width > 0 and diagram_rect.height > 0:
             q_diagram_rects[qnum] = [(page_num, diagram_rect)]
 
+    # Build Question objects
+    questions: list[Question] = []
+    for qnum, start, end in question_splits:
+        rects = question_rects.get(qnum, [])
+        y0 = min(r[1] for r in rects) if rects else 0.0
+        y1 = max(r[2] for r in rects) if rects else 0.0
+        diagram = q_diagram_rects.get(qnum)
+        image_rect = diagram[0] if diagram else None  # (page_num, rect)
+        questions.append(
+            Question(
+                number=qnum,
+                text=transform_math_for_llm(questions_text[qnum]),
+                y0=y0,
+                y1=y1,
+                image_rect=image_rect,
+            )
+        )
+
     # Collect all output paths we would write
     output_paths = []
-    for qnum, start, end in question_splits:
-        qname = f"question_{qnum:03d}"
+    for q in questions:
+        qname = f"question_{q.number:03d}"
         output_paths.append(output_dir / f"{qname}.txt")
-        for i in range(len(q_images.get(qnum, []))):
-            img_data, ext = q_images[qnum][i]
+        for i in range(len(q_images.get(q.number, []))):
+            img_data, ext = q_images[q.number][i]
             out_ext = ext if ext in ("png", "jpg", "jpeg") else "png"
             output_paths.append(output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}")
-        if qnum in DIAGRAM_QUESTIONS and q_diagram_rects.get(qnum):
+        if q.number in DIAGRAM_QUESTIONS and q.image_rect is not None:
             output_paths.append(output_dir / f"{qname}.png")
 
     if not overwrite:
@@ -267,24 +299,22 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path, overwrite: bool
             raise SystemExit(1)
 
     # Write output files
-    for qnum, start, end in question_splits:
-        text = transform_math_for_llm(questions_text[qnum])
-        qname = f"question_{qnum:03d}"
+    for q in questions:
+        qname = f"question_{q.number:03d}"
         txt_path = output_dir / f"{qname}.txt"
-        txt_path.write_text(text, encoding="utf-8")
+        txt_path.write_text(q.text, encoding="utf-8")
         print(f"Wrote {txt_path}")
 
-        for i, (img_data, ext) in enumerate(q_images.get(qnum, [])):
+        for i, (img_data, ext) in enumerate(q_images.get(q.number, [])):
             out_ext = ext if ext in ("png", "jpg", "jpeg") else "png"
             img_path = output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}"
             img_path.write_bytes(img_data)
             print(f"  Wrote diagram {img_path}")
 
         # Render vector diagrams for questions that have them
-        if qnum in DIAGRAM_QUESTIONS and q_diagram_rects.get(qnum):
-            rects = q_diagram_rects[qnum]
-            page_num = rects[0][0]
-            diagram_rect = rects[0][1]
+        if q.image_rect is not None:
+            rects = q_diagram_rects.get(q.number, [])
+            page_num, diagram_rect = rects[0]
             for _, r in rects[1:]:
                 diagram_rect |= r
             if diagram_rect.width > 0 and diagram_rect.height > 0:
