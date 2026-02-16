@@ -21,6 +21,8 @@ SUBSCRIPT_FLAG = 32
 DIAGRAM_QUESTIONS = {4, 7, 12, 19, 20, 23, 25, 28}
 # Padding around diagram bbox to include nearby labels (in points)
 DIAGRAM_PADDING = 8
+# Margin to exclude page border (in points)
+PAGE_BORDER_MARGIN = 55
 
 
 def transform_math_for_llm(text: str) -> str:
@@ -222,23 +224,26 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
             next_y0 = min(r[1] for r in nr)
             diagram_y1 = next_y0 - 5  # Stop just before next question
         else:
-            diagram_y1 = doc[page_num].rect.height - 36  # Bottom of page minus margin
+            diagram_y1 = doc[page_num].rect.height - PAGE_BORDER_MARGIN
 
-        # Diagram region: from bottom of question text to top of next question
-        diagram_y0 = q_y1 + 2  # Start just below question text
+        # Diagram region: start just below question text (exclude number, blank, text)
+        # and extend to just before next question
+        margin = PAGE_BORDER_MARGIN
+        diagram_y0 = max(margin, q_y1 + 5)  # Just below last line of question text
         min_height = 30
         if diagram_y1 <= diagram_y0:
-            # Overlapping - use fixed height below question (diagram may be inline)
-            diagram_y1 = min(q_y1 + 120, doc[page_num].rect.height - 36)
+            diagram_y1 = min(q_y1 + 120, doc[page_num].rect.height - margin)
         if diagram_y1 - diagram_y0 < min_height:
-            diagram_y1 = diagram_y0 + min(150, doc[page_num].rect.height - 36 - diagram_y0)
+            diagram_y1 = diagram_y0 + min(150, doc[page_num].rect.height - margin - diagram_y0)
+        diagram_y1 = max(diagram_y1, diagram_y0 + min_height)  # Ensure valid height
 
         page = doc[page_num]
         diagram_rect = pymupdf.Rect(
-            page.rect.x0 + 36, diagram_y0,
-            page.rect.x1 - 36, diagram_y1
+            page.rect.x0 + margin, diagram_y0,
+            page.rect.x1 - margin, diagram_y1
         )
-        q_diagram_rects[qnum] = [(page_num, diagram_rect)]
+        if diagram_rect.width > 0 and diagram_rect.height > 0:
+            q_diagram_rects[qnum] = [(page_num, diagram_rect)]
 
     # Write output files
     for qnum, start, end in question_splits:
@@ -261,11 +266,12 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
             diagram_rect = rects[0][1]
             for _, r in rects[1:]:
                 diagram_rect |= r
-            page = doc[page_num]
-            pix = page.get_pixmap(dpi=150, clip=diagram_rect)
-            diagram_path = output_dir / f"{qname}.png"
-            pix.save(str(diagram_path))
-            print(f"  Wrote diagram {diagram_path}")
+            if diagram_rect.width > 0 and diagram_rect.height > 0:
+                page = doc[page_num]
+                pix = page.get_pixmap(dpi=150, clip=diagram_rect)
+                diagram_path = output_dir / f"{qname}.png"
+                pix.save(str(diagram_path))
+                print(f"  Wrote diagram {diagram_path}")
 
     doc.close()
 
@@ -284,7 +290,7 @@ def main():
     parser.add_argument(
         "-o", "--output",
         type=Path,
-        required=True,
+        default=Path("test-output/extracted_questions"),
         help="Output directory for extracted files",
     )
     args = parser.parse_args()
