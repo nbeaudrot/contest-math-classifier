@@ -7,6 +7,7 @@ and saves diagram images as PNG files.
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 import pymupdf
@@ -140,7 +141,7 @@ def find_question_splits(full_text: str) -> list[tuple[int, int, int]]:
     return result
 
 
-def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
+def extract_questions_from_pdf(pdf_path: Path, output_dir: Path, overwrite: bool = False) -> None:
     """Main extraction logic."""
     output_dir.mkdir(parents=True, exist_ok=True)
     doc = pymupdf.open(pdf_path)
@@ -245,6 +246,26 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path) -> None:
         if diagram_rect.width > 0 and diagram_rect.height > 0:
             q_diagram_rects[qnum] = [(page_num, diagram_rect)]
 
+    # Collect all output paths we would write
+    output_paths = []
+    for qnum, start, end in question_splits:
+        qname = f"question_{qnum:03d}"
+        output_paths.append(output_dir / f"{qname}.txt")
+        for i in range(len(q_images.get(qnum, []))):
+            img_data, ext = q_images[qnum][i]
+            out_ext = ext if ext in ("png", "jpg", "jpeg") else "png"
+            output_paths.append(output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}")
+        if qnum in DIAGRAM_QUESTIONS and q_diagram_rects.get(qnum):
+            output_paths.append(output_dir / f"{qname}.png")
+
+    if not overwrite:
+        existing = [p for p in output_paths if p.exists()]
+        if existing:
+            print("Error: the following output files already exist (use --overwrite to overwrite):", file=sys.stderr)
+            for p in existing:
+                print(f"  {p}", file=sys.stderr)
+            raise SystemExit(1)
+
     # Write output files
     for qnum, start, end in question_splits:
         text = transform_math_for_llm(questions_text[qnum])
@@ -293,13 +314,19 @@ def main():
         default=Path("test-output/extracted_questions"),
         help="Output directory for extracted files",
     )
+    parser.add_argument(
+        "-w", "--overwrite",
+        action="store_true",
+        default=False,
+        help="Overwrite existing output files if present (default: do not overwrite)",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
         print(f"Error: PDF file not found: {args.pdf}")
         return 1
 
-    extract_questions_from_pdf(args.pdf, args.output)
+    extract_questions_from_pdf(args.pdf, args.output, overwrite=args.overwrite)
     return 0
 
 
