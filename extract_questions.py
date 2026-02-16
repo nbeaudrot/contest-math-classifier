@@ -320,11 +320,25 @@ def main():
         default=False,
         help="Overwrite existing output files if present (default: do not overwrite)",
     )
+    parser.add_argument(
+        "-r", "--clean",
+        default=False,
+        action="store_true",
+        help="Clean output directory before extracting questions",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
         print(f"Error: PDF file not found: {args.pdf}")
         return 1
+
+    if args.clean:
+        if args.output.exists():
+            for p in args.output.glob("*"):
+                if p.is_file():
+                    p.unlink()
+                elif p.is_dir():
+                    shutil.rmtree(p)
 
     extract_questions_from_pdf(args.pdf, args.output, overwrite=args.overwrite)
     return 0
