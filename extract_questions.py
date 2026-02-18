@@ -6,10 +6,11 @@ and saves diagram images as PNG files.
 """
 
 import argparse
+import logging
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -18,13 +19,15 @@ import pymupdf
 
 @dataclass
 class Question:
-    """A single extracted question with optional diagram region."""
+    """A single extracted question with optional diagram region and embedded images."""
 
     number: int
+    page_number: int  # 0-based page index in the PDF
     text: str
     y0: float
     y1: float
-    image_rect: Optional[tuple[int, pymupdf.Rect]] = None  # (page_num, rect) for diagram
+    image_rects: Optional[list[tuple[int, pymupdf.Rect]]] = None  # (page_num, rect) per diagram
+    images: list[tuple[bytes, str]] = field(default_factory=list)  # (bytes, ext) embedded images
 
 
 # Superscript flag in PyMuPDF span flags (bit 0)
@@ -93,14 +96,27 @@ def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> 
         blocks = page.get_text("dict")["blocks"]
 
     for block in blocks:
-        bbox = block.get("bbox", (0, 0, 0, 0))
-        y0, y1 = bbox[1], bbox[3]
         if block.get("type") == 1:
+            bbox = block.get("bbox", (0, 0, 0, 0))
+            x0, y0, x1, y1 = bbox
+            # skip image blocks that are part of the border
+            if x0 < PAGE_BORDER_MARGIN or x0 > doc[page_num].rect.width - PAGE_BORDER_MARGIN:
+                logging.debug(f"Skipping image block at x0={x0}, y0={y0}, x1={x1}, y1={y1} because it is part of the border")
+                continue
+            if y0 < PAGE_BORDER_MARGIN or y0 > doc[page_num].rect.height - PAGE_BORDER_MARGIN:
+                logging.debug(f"Skipping image block at x0={x0}, y0={y0}, x1={x1}, y1={y1} because it is part of the border")
+                continue
             img_data = block.get("image")
             if img_data:
                 ext = block.get("ext", "png")
                 items.append((y0, y1, "image", (img_data, ext)))
-        else:
+        elif block.get("type") == 0:
+            # skip text blocks that are part of the footer
+            bbox = block.get("bbox", (0, 0, 0, 0))
+            x0, y0, x1, y1 = bbox # might not need all of these ...
+            if y1 > doc[page_num].rect.height - PAGE_BORDER_MARGIN:
+                logging.debug(f"Skipping text block at y1={y1} because it is part of the footer")
+                continue
             text_parts = []
             for line in block.get("lines", []):
                 line_parts = []
@@ -117,6 +133,8 @@ def get_page_items(page: pymupdf.Page, doc: pymupdf.Document, page_num: int) -> 
             text = "\n".join(text_parts)
             if text.strip():
                 items.append((y0, y1, "text", text))
+        else:
+            pass
 
     # Also get images via get_images() - dict blocks may not include all
     seen_xrefs = set()
@@ -155,31 +173,132 @@ def find_question_splits(full_text: str) -> list[tuple[int, int, int]]:
     return result
 
 
-def extract_questions_from_pdf(pdf_path: Path, output_dir: Path, overwrite: bool = False) -> None:
-    """Main extraction logic."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    doc = pymupdf.open(pdf_path)
+# Full-page frame drawings (e.g. page border) to exclude from diagram detection
+FULL_PAGE_FRAME_HEIGHT = 700
 
-    # Build full text and ordered list of (page, y0, y1, type, content)
-    all_items = []
+
+def _compute_diagram_rects(
+    qnum: int,
+    question_rects: dict[int, list[tuple[int, float, float]]],
+    qnums_sorted: list[int],
+    doc: pymupdf.Document,
+) -> Optional[list[tuple[int, pymupdf.Rect]]]:
+    """
+    Compute diagram region for a question if it is in DIAGRAM_QUESTIONS.
+    Uses vector graphics (get_drawings) to find diagram bounding boxes between
+    this question's text and the next question's y0. Falls back to geometric
+    heuristic for diagram-as-table (e.g. Q4).
+    """
+    if qnum not in DIAGRAM_QUESTIONS:
+        return None
+    rects = question_rects.get(qnum, [])
+    if not rects:
+        return None
+    page_num = rects[0][0]
+    q_y0 = min(r[1] for r in rects)
+    q_y1 = max(r[2] for r in rects)
+
+    idx = qnums_sorted.index(qnum)
+    next_on_page = None
+    for nq in qnums_sorted[idx + 1:]:
+        nrects = question_rects.get(nq, [])
+        if nrects and any(r[0] == page_num for r in nrects):
+            next_on_page = nq
+            break
+    if next_on_page:
+        nr = [r for r in question_rects[next_on_page] if r[0] == page_num]
+        next_y0 = min(r[1] for r in nr)
+        band_y1 = next_y0 - 5
+    else:
+        band_y1 = doc[page_num].rect.height - PAGE_BORDER_MARGIN
+
+    margin = PAGE_BORDER_MARGIN
+    band_y0 = max(margin, q_y1 - 20)  # allow slight overlap with question text
+    page = doc[page_num]
+    page_height = page.rect.height
+
+    # Find vector graphics in the band between question and next question
+    diagram_rect = None
+    try:
+        drawings = page.get_drawings()
+        relevant_rects = []
+        for d in drawings:
+            r = d.get("rect")
+            if r is None:
+                continue
+            dy0 = r.y0 if hasattr(r, "y0") else r[1]
+            dy1 = r.y1 if hasattr(r, "y1") else r[3]
+            height = dy1 - dy0
+            # Exclude full-page frames
+            if height > FULL_PAGE_FRAME_HEIGHT:
+                continue
+            # Must overlap the band
+            if dy1 < band_y0 or dy0 > band_y1:
+                continue
+            relevant_rects.append(pymupdf.Rect(r))
+        if relevant_rects:
+            diagram_rect = relevant_rects[0]
+            for r in relevant_rects[1:]:
+                diagram_rect |= r
+            diagram_rect = pymupdf.Rect(
+                max(page.rect.x0 + margin, diagram_rect.x0 - DIAGRAM_PADDING),
+                max(margin, diagram_rect.y0 - DIAGRAM_PADDING),
+                min(page.rect.x1 - margin, diagram_rect.x1 + DIAGRAM_PADDING),
+                min(page_height - margin, diagram_rect.y1 + DIAGRAM_PADDING),
+            )
+    except Exception:
+        pass
+
+    # Fallback: geometric heuristic (e.g. for diagram-as-table like Q4)
+    if diagram_rect is None or diagram_rect.width <= 0 or diagram_rect.height <= 0:
+        diagram_y0 = max(margin, q_y1 + 5)
+        diagram_y1 = band_y1
+        min_height = 30
+        if diagram_y1 <= diagram_y0:
+            diagram_y1 = min(q_y1 + 120, page_height - margin)
+        if diagram_y1 - diagram_y0 < min_height:
+            diagram_y1 = diagram_y0 + min(150, page_height - margin - diagram_y0)
+        diagram_y1 = max(diagram_y1, diagram_y0 + min_height)
+        diagram_rect = pymupdf.Rect(
+            page.rect.x0 + margin, diagram_y0,
+            page.rect.x1 - margin, diagram_y1
+        )
+
+    if diagram_rect.width <= 0 or diagram_rect.height <= 0:
+        return None
+    return [(page_num, diagram_rect)]
+
+
+def _print_questions_summary(questions: list[Question]) -> None:
+    """Print a summary of each question: number, page, y0/y1, and image rect if present."""
+    for q in questions:
+        page_display = q.page_number + 1  # 1-based for user
+        line = f"Question {q.number}: page {page_display}, y0={q.y0:.1f}, y1={q.y1:.1f}"
+        if q.image_rects:
+            _page_num, rect = q.image_rects[0]
+            line += f", image_rect=({rect.x0:.1f}, {rect.y0:.1f}, {rect.x1:.1f}, {rect.y1:.1f})"
+        print(line)
+
+def extract_questions_from_page(doc: pymupdf.Document, page_num: int) -> list[Question]:
+    """Extract questions from a single page."""
+    page = doc[page_num]
     full_text_parts = []
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        for y0, y1, item_type, content in get_page_items(page, doc, page_num):
-            all_items.append((page_num, y0, y1, item_type, content))
-            if item_type == "text":
-                full_text_parts.append(content)
-
+    all_items = []
+    for y0, y1, item_type, content in get_page_items(page, doc, page_num):
+        all_items.append((page_num, y0, y1, item_type, content))
+        if item_type == "text":
+            full_text_parts.append(content)
     full_text = "\n".join(full_text_parts)
     question_splits = find_question_splits(full_text)
-
-    # Extract question text
     questions_text = {qnum: full_text[start:end] for qnum, start, end in question_splits}
 
-    # Build question -> (page_num, y_start, y_end) for text blocks
+
+    # Single pass: assign text blocks and images to questions by current text position
     question_rects = {qnum: [] for qnum, _, _ in question_splits}
+    q_images = {qnum: [] for qnum, _, _ in question_splits}
     current_q = question_splits[0][0] if question_splits else 1
     text_pos = 0
+    seen_image_hashes: set[int] = set()
 
     for page_num, y0, y1, item_type, content in all_items:
         if item_type == "text":
@@ -189,140 +308,107 @@ def extract_questions_from_pdf(pdf_path: Path, output_dir: Path, overwrite: bool
                     break
             question_rects[current_q].append((page_num, y0, y1))
             text_pos += len(content) + 1
-
-    # Associate images with questions: process items in order, track text position
-    q_images = {qnum: [] for qnum, _, _ in question_splits}
-    current_q = question_splits[0][0] if question_splits else 1
-    text_pos = 0
-    seen_image_hashes = set()
-
-    for page_num, y0, y1, item_type, content in all_items:
-        if item_type == "text":
-            for qnum, start, end in question_splits:
-                if start <= text_pos < end:
-                    current_q = qnum
-                    break
-            text_pos += len(content) + 1
         elif item_type == "image":
             img_data, ext = content
             h = hash(img_data) if len(img_data) < 10000 else hash(img_data[:1000])
-            if h in seen_image_hashes:
-                continue
-            seen_image_hashes.add(h)
-            if current_q in q_images:
-                q_images[current_q].append((img_data, ext))
+            if h not in seen_image_hashes:
+                seen_image_hashes.add(h)
+                if current_q in q_images:
+                    q_images[current_q].append((img_data, ext))
 
-    # Extract diagram regions for DIAGRAM_QUESTIONS
-    # Diagrams appear between a question's text and the next question's text on the same page
-    q_diagram_rects = {}
+    # Build each question as we go: compute diagram rect for this question, then create Question
     qnums_sorted = [qnum for qnum, _, _ in question_splits]
-    for qnum in DIAGRAM_QUESTIONS:
-        if qnum not in qnums_sorted:
-            continue
-        rects = question_rects.get(qnum, [])
-        if not rects:
-            continue
-        page_num = rects[0][0]
-        q_y0 = min(r[1] for r in rects)
-        q_y1 = max(r[2] for r in rects)
-
-        # Find next question on same page (diagram is between this and next)
-        idx = qnums_sorted.index(qnum)
-        next_on_page = None
-        for nq in qnums_sorted[idx + 1:]:
-            nrects = question_rects.get(nq, [])
-            if nrects and any(r[0] == page_num for r in nrects):
-                next_on_page = nq
-                break
-        if next_on_page:
-            nr = [r for r in question_rects[next_on_page] if r[0] == page_num]
-            next_y0 = min(r[1] for r in nr)
-            diagram_y1 = next_y0 - 5  # Stop just before next question
-        else:
-            diagram_y1 = doc[page_num].rect.height - PAGE_BORDER_MARGIN
-
-        # Diagram region: start just below question text (exclude number, blank, text)
-        # and extend to just before next question
-        margin = PAGE_BORDER_MARGIN
-        diagram_y0 = max(margin, q_y1 + 5)  # Just below last line of question text
-        min_height = 30
-        if diagram_y1 <= diagram_y0:
-            diagram_y1 = min(q_y1 + 120, doc[page_num].rect.height - margin)
-        if diagram_y1 - diagram_y0 < min_height:
-            diagram_y1 = diagram_y0 + min(150, doc[page_num].rect.height - margin - diagram_y0)
-        diagram_y1 = max(diagram_y1, diagram_y0 + min_height)  # Ensure valid height
-
-        page = doc[page_num]
-        diagram_rect = pymupdf.Rect(
-            page.rect.x0 + margin, diagram_y0,
-            page.rect.x1 - margin, diagram_y1
-        )
-        if diagram_rect.width > 0 and diagram_rect.height > 0:
-            q_diagram_rects[qnum] = [(page_num, diagram_rect)]
-
-    # Build Question objects
-    questions: list[Question] = []
+    result: list[Question] = []
     for qnum, start, end in question_splits:
         rects = question_rects.get(qnum, [])
+        page_num = rects[0][0] if rects else 0
         y0 = min(r[1] for r in rects) if rects else 0.0
         y1 = max(r[2] for r in rects) if rects else 0.0
-        diagram = q_diagram_rects.get(qnum)
-        image_rect = diagram[0] if diagram else None  # (page_num, rect)
-        questions.append(
+        image_rects = _compute_diagram_rects(qnum, question_rects, qnums_sorted, doc)
+        if image_rects:
+            d_y0 = min(r.y0 for _, r in image_rects)
+            d_y1 = max(r.y1 for _, r in image_rects)
+            y0 = min(y0, d_y0)
+            y1 = max(y1, d_y1)
+        result.append(
             Question(
                 number=qnum,
+                page_number=page_num,
                 text=transform_math_for_llm(questions_text[qnum]),
                 y0=y0,
                 y1=y1,
-                image_rect=image_rect,
+                image_rects=image_rects,
+                images=q_images.get(qnum, []),
             )
         )
+    return result
+
+def extract_questions_from_pdf(
+    pdf_path: Path,
+    output_dir: Path,
+    overwrite: bool = False,
+    summary: bool = False,
+) -> None:
+    """Main extraction logic."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open(pdf_path)
+
+    # Build full text and ordered list of (page, y0, y1, type, content)
+    # Skip page 0 (title page)
+    all_items = []
+    full_text_parts = []
+    questions: list[Question] = []
+    for page_num in range(1, len(doc)):
+        this_page_questions = extract_questions_from_page(doc, page_num)
+        questions.extend(this_page_questions)
 
     # Collect all output paths we would write
     output_paths = []
     for q in questions:
         qname = f"question_{q.number:03d}"
         output_paths.append(output_dir / f"{qname}.txt")
-        for i in range(len(q_images.get(q.number, []))):
-            img_data, ext = q_images[q.number][i]
+        for i in range(len(q.images)):
+            img_data, ext = q.images[i]
             out_ext = ext if ext in ("png", "jpg", "jpeg") else "png"
             output_paths.append(output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}")
-        if q.number in DIAGRAM_QUESTIONS and q.image_rect is not None:
+        if q.image_rects:
             output_paths.append(output_dir / f"{qname}.png")
 
     if not overwrite:
         existing = [p for p in output_paths if p.exists()]
         if existing:
-            print("Error: the following output files already exist (use --overwrite to overwrite):", file=sys.stderr)
+            logging.error("Error: the following output files already exist (use --overwrite to overwrite):", file=sys.stderr)
             for p in existing:
-                print(f"  {p}", file=sys.stderr)
+                logging.error(f"  {p}", file=sys.stderr)
             raise SystemExit(1)
+
+    if summary:
+        _print_questions_summary(questions)
 
     # Write output files
     for q in questions:
         qname = f"question_{q.number:03d}"
         txt_path = output_dir / f"{qname}.txt"
         txt_path.write_text(q.text, encoding="utf-8")
-        print(f"Wrote {txt_path}")
+        logging.debug(f"Wrote {txt_path}")
 
-        for i, (img_data, ext) in enumerate(q_images.get(q.number, [])):
+        for i, (img_data, ext) in enumerate(q.images):
             out_ext = ext if ext in ("png", "jpg", "jpeg") else "png"
             img_path = output_dir / f"{qname}_diagram_{i+1:02d}.{out_ext}"
             img_path.write_bytes(img_data)
-            print(f"  Wrote diagram {img_path}")
+            logging.debug(f"  Wrote diagram {img_path}")
 
-        # Render vector diagrams for questions that have them
-        if q.image_rect is not None:
-            rects = q_diagram_rects.get(q.number, [])
-            page_num, diagram_rect = rects[0]
-            for _, r in rects[1:]:
+        if q.image_rects:
+            page_num, diagram_rect = q.image_rects[0]
+            diagram_rect = pymupdf.Rect(diagram_rect)  # copy before merging
+            for _, r in q.image_rects[1:]:
                 diagram_rect |= r
             if diagram_rect.width > 0 and diagram_rect.height > 0:
                 page = doc[page_num]
                 pix = page.get_pixmap(dpi=150, clip=diagram_rect)
                 diagram_path = output_dir / f"{qname}.png"
                 pix.save(str(diagram_path))
-                print(f"  Wrote diagram {diagram_path}")
+                logging.debug(f"  Wrote diagram {diagram_path}")
 
     doc.close()
 
@@ -356,7 +442,22 @@ def main():
         action="store_true",
         help="Clean output directory before extracting questions",
     )
+    parser.add_argument(
+        "-s", "--summary",
+        default=False,
+        action="store_true",
+        help="Print a summary of the extracted questions",
+    )
+    parser.add_argument(
+        "-l", "--loglevel",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the log level",
+    )
     args = parser.parse_args()
+
+    level = getattr(logging, args.loglevel)
+    logging.basicConfig(level=level)
 
     if not args.pdf.exists():
         print(f"Error: PDF file not found: {args.pdf}")
@@ -370,7 +471,12 @@ def main():
                 elif p.is_dir():
                     shutil.rmtree(p)
 
-    extract_questions_from_pdf(args.pdf, args.output, overwrite=args.overwrite)
+    extract_questions_from_pdf(
+        args.pdf,
+        args.output,
+        overwrite=args.overwrite,
+        summary=args.summary,
+    )
     return 0
 
 
