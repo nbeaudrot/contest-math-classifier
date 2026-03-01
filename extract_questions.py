@@ -341,6 +341,18 @@ def extract_questions_from_page(doc: pymupdf.Document, page_num: int) -> list[Qu
                 images=q_images.get(qnum, []),
             )
         )
+
+    # Validate top-to-bottom order on this page: each question's y0 must be >= previous question's y1
+    """
+    for i in range(1, len(result)):
+        prev_y1 = result[i - 1].y1
+        curr_y0 = result[i].y0
+        if curr_y0 < prev_y1:
+            raise ValueError(
+                f"Page {page_num + 1}: question {result[i].number} y0={curr_y0} is less than "
+                f"previous question {result[i - 1].number} y1={prev_y1}; questions must be ordered top-to-bottom."
+            )
+    """
     return result
 
 def extract_questions_from_pdf(
