@@ -24,10 +24,6 @@ PAGE_BORDER_MARGIN = 55
 # Bottom margin to exclude copyright notice (points)
 BOTTOM_COPYRIGHT_MARGIN = 55
 
-# PyMuPDF span flags for script
-SUPERSCRIPT_FLAG = 1
-SUBSCRIPT_FLAG = 32
-
 # Pattern: "1. _____________" or "10.\t_____________"
 ANSWER_BLANK_PATTERN = re.compile(r"^(\d+)\.\s+_+\s*$", re.MULTILINE)
 
@@ -37,6 +33,16 @@ QUESTION_TEXT_MIN_WIDTH = 170
 QUESTION_COLUMN_X0 = 150
 # Tolerance for "inside blank bbox" (float comparison)
 UNITS_BBOX_TOLERANCE = 0.5
+
+# Superscript/subscript: PyMuPDF span flags (same as extract_questions.py)
+SUPERSCRIPT_FLAG = 1   # bit 0
+SUBSCRIPT_FLAG = 32    # bit 5
+
+# Fraction detection: only treat as fraction when numerator/denominator are short (e.g. 1/2, 3/4).
+FRACTION_MAX_NUMERATOR_LEN = 6   # max chars for numerator text
+FRACTION_MAX_DENOMINATOR_LEN = 6 # max chars for denominator text
+FRACTION_VERTICAL_GAP_MAX = 8    # pts; numerator span's y1 must be <= denominator's y0 + this
+FRACTION_X_OVERLAP_MIN = 2       # pts; spans must overlap or be this close in x
 
 
 @dataclass
@@ -57,28 +63,84 @@ def rect_to_list(rect: pymupdf.Rect) -> list[float]:
     return [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)]
 
 
-def block_text_with_notation(block: dict) -> str:
+def _spans_form_stacked_fraction(span_a: dict, span_b: dict) -> bool:
     """
-    Extract text from a text block with superscripts as ^...^ and subscripts as _..._.
-    Then convert unicode roots to fractional exponents (e.g. √x -> (x)^(1/2)).
+    True if span_a is drawn above span_b with similar x and both are short (numerator/denominator).
+    Only short spans (e.g. digits) are treated as fractions; paragraph lines are not.
     """
-    if block.get("type") != 0:
-        return ""
-    lines = []
-    for line in block.get("lines", []):
-        parts = []
+    text_a = (span_a.get("text") or "").strip()
+    text_b = (span_b.get("text") or "").strip()
+    if len(text_a) > FRACTION_MAX_NUMERATOR_LEN or len(text_b) > FRACTION_MAX_DENOMINATOR_LEN:
+        return False
+    bbox_a = span_a.get("bbox", (0, 0, 0, 0))
+    bbox_b = span_b.get("bbox", (0, 0, 0, 0))
+    if len(bbox_a) != 4 or len(bbox_b) != 4:
+        return False
+    x0_a, y0_a, x1_a, y1_a = bbox_a
+    x0_b, y0_b, x1_b, y1_b = bbox_b
+    # A is above B: A's bottom is at or above B's top (with small gap)
+    if y1_a > y0_b + FRACTION_VERTICAL_GAP_MAX:
+        return False
+    # Similar x: overlap or nearly adjacent
+    x_overlap = min(x1_a, x1_b) - max(x0_a, x0_b)
+    return x_overlap >= -FRACTION_X_OVERLAP_MIN
+
+
+def _block_spans_with_fractions(block: dict) -> list[tuple[str, int]]:
+    """
+    Flatten block to (text_segment, line_index) in reading order. Apply
+    superscript (^) and subscript (_) from span flags. Merge any two
+    consecutive spans that form a stacked fraction into \\frac{num}{denom}.
+    """
+    segments: list[tuple[str, dict, int]] = []  # (text, span, line_index)
+    for line_i, line in enumerate(block.get("lines", [])):
         for span in line.get("spans", []):
             t = span.get("text", "")
             flags = span.get("flags", 0)
-            if flags & SUPERSCRIPT_FLAG:
-                parts.append(f"^{t}^")
-            elif flags & SUBSCRIPT_FLAG:
-                parts.append(f"_{t}_")
+            if (
+                segments
+                and t
+                and segments[-1][0].strip()
+                and _spans_form_stacked_fraction(segments[-1][1], span)
+            ):
+                num_raw = segments[-1][1].get("text", "").strip()
+                segments.pop()
+                segments.append(
+                    (f"\\frac{{{num_raw}}}{{{t.strip()}}}", span, line_i)
+                )
             else:
-                parts.append(t)
-        lines.append("".join(parts))
-    text = "\n".join(lines)
-    return convert_roots_to_exponents(text)
+                if flags & SUPERSCRIPT_FLAG:
+                    t = f"^{t}"
+                elif flags & SUBSCRIPT_FLAG:
+                    t = f"_{t}_"
+                segments.append((t, span, line_i))
+    return [(seg[0], seg[2]) for seg in segments]
+
+
+def block_text_with_notation(block: dict) -> str:
+    """
+    Extract text from a text block with superscripts as ^... (no trailing ^) and
+    subscripts as _..._. Detects fractions: when two spans are vertically stacked
+    (numerator above denominator by bbox), merge as \\frac{num}{denom}. Then
+    convert unicode roots to fractional exponents (e.g. √x -> (x)^(1/2)).
+    """
+    if block.get("type") != 0:
+        return ""
+    segments_with_line = _block_spans_with_fractions(block)
+    lines_out = []
+    current = []
+    prev_line = None
+    for text, line_i in segments_with_line:
+        if prev_line is not None and line_i != prev_line:
+            lines_out.append("".join(current))
+            current = []
+        current.append(text)
+        prev_line = line_i
+    if current:
+        lines_out.append("".join(current))
+    text = "\n".join(lines_out)
+    text = convert_roots_to_exponents(text)
+    return clean_superscript_artifacts(text)
 
 
 def convert_roots_to_exponents(text: str) -> str:
@@ -100,6 +162,23 @@ def convert_roots_to_exponents(text: str) -> str:
     text = re.sub(r"√\s*\(([^)]+)\)|√\s*([^\s^\[\]{}()]+)", repl_sq, text)
     text = re.sub(r"∛\s*\(([^)]+)\)|∛\s*([^\s^\[\]{}()]+)", repl_cb, text)
     text = re.sub(r"∜\s*\(([^)]+)\)|∜\s*([^\s^\[\]{}()]+)", repl_four, text)
+    return text
+
+
+def clean_superscript_artifacts(text: str) -> str:
+    """
+    Fix spurious ^ from PDF superscript styling that is not a real exponent.
+    - ^y^ or ^xy^ (letters only in carets) -> y, xy (variable/product, not exponent).
+    - Lone ^ after \\frac{...} or space -> remove (stray superscript span).
+    Keeps real exponents: cm^2, m^2, x^2, ^(1/2), etc. (no closing ^ or digit after ^).
+    """
+    # Unwrap carets around letters only: ^y^ -> y, 12^xy^ -> 12xy
+    text = re.sub(r"\^([a-zA-Z]+)\^", r"\1", text)
+    # Remove lone ^ (space-caret-space or } ^)
+    text = re.sub(r" \^ ", " ", text)
+    text = re.sub(r"\} \^", "}", text)
+    # Collapse any double space left after removals
+    text = re.sub(r"  +", " ", text)
     return text
 
 
@@ -200,6 +279,8 @@ def extract_questions_from_page(
         text_str = " ".join(
             s.strip() for _, s, _ in question_text_parts if s.strip()
         ).strip()
+        # Remove all newlines (replace with space and collapse runs of spaces)
+        text_str = " ".join(text_str.replace("\n", " ").split())
         text_bbox: Optional[pymupdf.Rect] = None
         if question_text_parts:
             text_bbox = question_text_parts[0][2]
